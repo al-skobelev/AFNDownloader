@@ -23,6 +23,12 @@
 
 - (void) connection: (NSURLConnection*) connection 
      didReceiveData: (NSData*) data;
+
+- (void) connectionDidFinishLoading: (NSURLConnection*) connection;
+
+- (void) connection: (NSURLConnection*) connection 
+   didFailWithError: (NSError*) error;
+
 @end
 
 //============================================================================
@@ -34,8 +40,12 @@
 @property (copy, nonatomic)   id             updateUserHandler;
 @property (strong, nonatomic) NSURL*         url;
 @property (strong, nonatomic) NSString*      filepath;
+@property (strong, nonatomic) NSMutableData* buffer;
 
+@property (readwrite, nonatomic, retain) NSURLConnection *connection;
 @end
+
+#define BUFFER_LIMIT 200000
 
 //============================================================================
 @implementation DownloadOperation 
@@ -46,6 +56,21 @@
 @synthesize updateUserHandler     = _updateUserHandler;
 @synthesize url                   = _url;
 @synthesize filepath              = _filepath;
+@synthesize buffer                = _buffer;
+
+@dynamic connection;
+
+//----------------------------------------------------------------------------
+- (void) flushStreamBuffer: (BOOL) force
+{
+    if (self.connection && (self.buffer.length > (force ? 0 : BUFFER_LIMIT)))
+    {
+        [super connection: self.connection 
+           didReceiveData: self.buffer];
+
+        [self.buffer setLength: 0];
+    }
+}
 
 //----------------------------------------------------------------------------
 - (void) connection: (NSURLConnection*) connection 
@@ -61,6 +86,7 @@
 
     if (! [self hasAcceptableStatusCode])
     {
+        self.buffer = nil;
         [self cancel];
         if (self.completionBlock) self.completionBlock();
     }
@@ -72,18 +98,47 @@
 {
     if (! [self isCancelled])
     {
-        [super connection: connection 
-           didReceiveData: data];
+        [self.buffer appendData: data];
+        [self flushStreamBuffer: NO];
     }
+}
+
+//----------------------------------------------------------------------------
+- (void) connectionDidFinishLoading: (NSURLConnection*) connection 
+{
+    [self flushStreamBuffer: YES];
+
+    [super connectionDidFinishLoading: connection];
+}
+
+//----------------------------------------------------------------------------
+- (void) connection: (NSURLConnection*) connection 
+   didFailWithError: (NSError*) error 
+{
+    [self flushStreamBuffer: YES];
+
+    [super connection: connection 
+     didFailWithError: error];
 }
 
 //----------------------------------------------------------------------------
 - (void) start
 {
+    self.buffer = [NSMutableData dataWithCapacity: (BUFFER_LIMIT | 0xFFFF) + 1];
     [super start];
+
     self.networkStatus = [[Reachability reachabilityForLocalWiFi]
                              currentReachabilityStatus];
 }
+
+//----------------------------------------------------------------------------
+- (void) cancel
+{
+    [self flushStreamBuffer: YES];
+    self.buffer = nil;
+    [super cancel];
+}
+
 @end
 
 
