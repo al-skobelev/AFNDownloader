@@ -8,6 +8,7 @@
 #import <AFNetworking.h>
 #import <CommonCrypto/CommonDigest.h>
 #import "CommonUtils.h"
+#import "Reachability.h"
 
 #define DMGR_QUEUE_NAME @"com.iziteq.downloadmanager.queue"
 
@@ -26,12 +27,25 @@
 
 //============================================================================
 @interface DownloadOperation : AFHTTPRequestOperation
-@property (assign, nonatomic) int retryCount;
+
+@property (assign, nonatomic) int            retryCount;
+@property (assign, nonatomic) NetworkStatus  networkStatus;
+@property (copy, nonatomic)   id             completionUserHandler;
+@property (copy, nonatomic)   id             updateUserHandler;
+@property (strong, nonatomic) NSURL*         url;
+@property (strong, nonatomic) NSString*      filepath;
+
 @end
 
 //============================================================================
 @implementation DownloadOperation 
-@synthesize retryCount = _retryCount;
+
+@synthesize retryCount            = _retryCount;
+@synthesize networkStatus         = _networkStatus;
+@synthesize completionUserHandler = _completionUserHandler;
+@synthesize updateUserHandler     = _updateUserHandler;
+@synthesize url                   = _url;
+@synthesize filepath              = _filepath;
 
 //----------------------------------------------------------------------------
 - (void) connection: (NSURLConnection*) connection 
@@ -63,6 +77,13 @@
     }
 }
 
+//----------------------------------------------------------------------------
+- (void) start
+{
+    [super start];
+    self.networkStatus = [[Reachability reachabilityForLocalWiFi]
+                             currentReachabilityStatus];
+}
 @end
 
 
@@ -71,15 +92,17 @@
 @interface DownloadManager ()
 
 @property (strong, nonatomic) NSOperationQueue* queue;
+@property (strong, nonatomic) Reachability*     reachability;
 @end
 
 //============================================================================
 @implementation DownloadManager 
 
 @synthesize queue = _queue;
+@synthesize reachability = _reachability;
 
 //----------------------------------------------------------------------------
-- (NSString*) md5ForFileAtPath: (NSString*) path
++ (NSString*) md5ForFileAtPath: (NSString*) path
 {
     CC_MD5_CTX ctx;
     NSMutableString* md5str = nil;
@@ -136,7 +159,39 @@ QUIT:
     [_queue setName: DMGR_QUEUE_NAME];
     [_queue setMaxConcurrentOperationCount: 1];
 
+    self.reachability = [Reachability reachabilityForLocalWiFi];
+    [self.reachability startNotifier];
+
+    ADD_OBSERVER (kReachabilityChangedNotification, self, onReachabilityChangedNtf:);
     return self;
+}
+
+//----------------------------------------------------------------------------
+- (void) onReachabilityChangedNtf: (NSNotification*) ntf
+{
+    NetworkStatus status = [[ntf object] currentReachabilityStatus];
+    if (ReachableViaWiFi == status)
+    {
+        [_queue.operations enumerateObjectsUsingBlock:
+             ^(DownloadOperation* op, NSUInteger idx, BOOL *stop)
+             {
+                 if (op.isExecuting && op.networkStatus != ReachableViaWiFi)
+                 {
+                     [op cancel];
+                     [self retryOperation: op];
+                 }
+             }];
+    }
+}
+
+//----------------------------------------------------------------------------
+- (BOOL) retryOperation: (DownloadOperation*) op
+{
+    return [self downloadFileAtURL: op.url
+                            toPath: op.filepath
+                 completionHandler: op.completionUserHandler
+                     updateHandler: op.updateUserHandler
+                        retryCount: op.retryCount];
 }
 
 //----------------------------------------------------------------------------
@@ -155,6 +210,7 @@ QUIT:
     NSString* datapath = STR_ADDEXT (filepath, @"partial");
 
     size_t flen = 0;
+
     if ([fm fileExistsAtPath: datapath])
     {
         NSError* err;
@@ -170,25 +226,18 @@ QUIT:
         }
     }
 
-
-    DownloadOperation* op = [[DownloadOperation alloc] initWithRequest: req];
-    op.outputStream = [NSOutputStream outputStreamToFileAtPath: datapath append: YES];
-
-    BOOL (^retryBlock)(int) = 
-        ^(int retryCount) 
+    BOOL (^retryBlock)(DownloadOperation*) = 
+        ^(DownloadOperation* op) 
         {
             static double _s_retry_delays[] = { 2, 3, 5 };     
              
-            if (retryCount < NELEMS (_s_retry_delays)) 
+            if (op.retryCount < NELEMS (_s_retry_delays)) 
             {
-                dispatch_after (dispatch_time (DISPATCH_TIME_NOW, _s_retry_delays [retryCount] * NSEC_PER_SEC),
+                dispatch_after (dispatch_time (DISPATCH_TIME_NOW, _s_retry_delays [op.retryCount] * NSEC_PER_SEC),
                                 dispatch_get_main_queue(),
                                 ^{
-                                    [self downloadFileAtURL: url
-                                                     toPath: filepath
-                                          completionHandler: completionHandler
-                                              updateHandler: updateHandler
-                                                 retryCount: (retryCount + 1)];
+                                    ++op.retryCount;
+                                    [self retryOperation: op];
                                 });
                 return YES;
             }
@@ -197,10 +246,10 @@ QUIT:
     
 
     id successBlock = 
-        ^(DownloadOperation* operation, id responseObject) 
+        ^(DownloadOperation* op, id responseObject) 
         {
-             DFNLOG(@"IN SUCCESS COMPLETION HANDLER FOR REQUEST: %@", req);
-             DFNLOG(@"MD5 for \"%@\": %@", datapath, [self md5ForFileAtPath: datapath]);
+             DFNLOG (@"IN SUCCESS COMPLETION HANDLER FOR REQUEST: %@", req);
+             DFNLOG (@"MD5 for \"%@\": %@", datapath, [DownloadManager md5ForFileAtPath: datapath]);
              
              unlink ([filepath fileSystemRepresentation]);
 
@@ -214,29 +263,44 @@ QUIT:
         };
 
     id failureBlock = 
-        ^(DownloadOperation* operation, NSError *error) 
+        ^(DownloadOperation* op, NSError *error) 
         {
-            DFNLOG(@"IN FAILURE COMPLETION HANDLER FOR REQUEST: %@", operation.request);
-            DFNLOG(@"-- ERROR: %@", [error localizedDescription]);
+            DFNLOG (@"IN FAILURE COMPLETION HANDLER FOR REQUEST: %@", op.request);
+            DFNLOG (@"-- ERROR: %@", [error localizedDescription]);
 
-            if (! ([operation isCancelled] || retryBlock (operation.retryCount)))
+            if (! ([op isCancelled] || retryBlock (op)))
             {
                 if (completionHandler) completionHandler (error);
             }
         };
          
-    [op setShouldExecuteAsBackgroundTaskWithExpirationHandler: ^{ retryBlock(0); }];
 
-    op.retryCount = recount;
-    [op setDownloadProgressBlock:
+    id progressBlock = 
         ^(NSInteger bytesRead, long long totalBytesRead, long long totalBytesExpectedToRead)
         {
             DFNLOG(@"GOT DATA OF LENGTH: %d", bytesRead);
-            if (updateHandler) updateHandler (flen+totalBytesRead, flen+totalBytesExpectedToRead);
-        }];
+            if (updateHandler) updateHandler (flen + totalBytesRead, flen + totalBytesExpectedToRead);
+        };
 
+
+
+    DownloadOperation* op = [[DownloadOperation alloc] initWithRequest: req];
+    op.outputStream = [NSOutputStream outputStreamToFileAtPath: datapath append: YES];
+
+    op.completionUserHandler = completionHandler;
+    op.updateUserHandler = updateHandler;
+    op.filepath = filepath;
+    op.url = url;
+    op.retryCount = recount;
+
+    DownloadOperation* __weak op_weak = op;
+    [op setShouldExecuteAsBackgroundTaskWithExpirationHandler: ^{ 
+         if (op_weak) { op_weak.retryCount = 0; retryBlock(op_weak); }}];
+    
+    [op setDownloadProgressBlock: progressBlock];
     [op setCompletionBlockWithSuccess: successBlock
                               failure: failureBlock];
+
 
     [self.queue addOperation: op];
     return YES;
@@ -254,6 +318,7 @@ QUIT:
                      updateHandler: updateHandler
                         retryCount: 0];
 }
+
 @end
 
 /* EOF */
